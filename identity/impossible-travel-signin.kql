@@ -1,0 +1,45 @@
+// Title: Impossible Travel Sign-In
+//
+// Description: Flags a user signing in successfully from two locations that
+// are geographically too far apart to have been reached in the time between
+// the two sign-ins - a strong indicator of credential compromise (one of the
+// sign-ins is likely an attacker using stolen credentials from elsewhere).
+//
+// Data source: SigninLogs (Microsoft Entra ID sign-in logs)
+// MITRE ATT&CK: T1078 - Valid Accounts
+// Severity: High
+//
+// Known false positives:
+//   - Users on VPNs or corporate proxies that route through a different region
+//   - Users who genuinely traveled (connected from an airport, then landed
+//     and connected again) - cross-check with travel/calendar context if available
+//   - Inaccurate IP geolocation data (rare, but happens with some ISPs/CDNs)
+
+let TimeRange = 1d;
+let SpeedThresholdKmh = 1000; // faster than a commercial flight implies impossible travel
+SigninLogs
+| where TimeGenerated > ago(TimeRange)
+| where ResultType == 0 // successful sign-ins only
+| where isnotempty(LocationDetails)
+| extend Latitude = toreal(LocationDetails.geoCoordinates.latitude),
+         Longitude = toreal(LocationDetails.geoCoordinates.longitude),
+         City = tostring(LocationDetails.city),
+         Country = tostring(LocationDetails.countryOrRegion)
+| where isnotempty(Latitude) and isnotempty(Longitude)
+| sort by UserPrincipalName asc, TimeGenerated asc
+| serialize
+| extend PrevTime = prev(TimeGenerated),
+         PrevLat = prev(Latitude),
+         PrevLong = prev(Longitude),
+         PrevCity = prev(City),
+         PrevUser = prev(UserPrincipalName)
+| where UserPrincipalName == PrevUser
+| extend DistanceKm = geo_distance_2points(Longitude, Latitude, PrevLong, PrevLat) / 1000
+| extend HoursBetween = datetime_diff('minute', TimeGenerated, PrevTime) / 60.0
+| where HoursBetween > 0 and HoursBetween < 24
+| extend RequiredSpeedKmh = DistanceKm / HoursBetween
+| where RequiredSpeedKmh > SpeedThresholdKmh
+| project TimeGenerated, UserPrincipalName, PrevCity, City, PrevTime,
+          DistanceKm = round(DistanceKm, 0), HoursBetween = round(HoursBetween, 2),
+          RequiredSpeedKmh = round(RequiredSpeedKmh, 0), IPAddress, AppDisplayName
+| order by TimeGenerated desc

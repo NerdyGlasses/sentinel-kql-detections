@@ -1,0 +1,40 @@
+// Title: Privileged Entra ID Role Assignment
+//
+// Description: Flags whenever a user or service principal is added to a
+// high-privilege Entra ID directory role (Global Administrator, Privileged
+// Role Administrator, etc). Privilege escalation is a key step in most
+// serious breaches, so every one of these events deserves a look, even
+// though most will be legitimate admin activity.
+//
+// Data source: AuditLogs (Microsoft Entra ID audit logs)
+// MITRE ATT&CK: T1098 - Account Manipulation
+// Severity: Medium (High if the target/initiator is unexpected or outside
+//           of a change-management window)
+//
+// Known false positives:
+//   - Scheduled/approved access reviews and legitimate onboarding
+//   - PIM (Privileged Identity Management) activations, which are expected
+//     and time-bound - cross-reference against PIM logs if this fires often
+//     on activations rather than permanent assignments
+
+let HighPrivilegeRoles = dynamic([
+    "Global Administrator",
+    "Privileged Role Administrator",
+    "Security Administrator",
+    "User Administrator",
+    "Application Administrator",
+    "Cloud Application Administrator"
+]);
+AuditLogs
+| where OperationName == "Add member to role"
+| where TargetResources has_any (HighPrivilegeRoles)
+| extend RoleName = tostring(TargetResources[0].modifiedProperties[1].newValue)
+| extend RoleName = trim('"', RoleName)
+| where RoleName in (HighPrivilegeRoles)
+| extend TargetUser = tostring(TargetResources[0].userPrincipalName),
+          InitiatedByUser = tostring(InitiatedBy.user.userPrincipalName),
+          InitiatedByApp = tostring(InitiatedBy.app.displayName)
+| project TimeGenerated, RoleName, TargetUser,
+          InitiatedBy = iff(isnotempty(InitiatedByUser), InitiatedByUser, InitiatedByApp),
+          Result, CorrelationId
+| order by TimeGenerated desc

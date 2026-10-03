@@ -1,0 +1,47 @@
+// Title: Anomalous Key Vault Secret/Key Access Volume
+//
+// Description: Flags an identity reading an unusually high number of
+// secrets or keys from a Key Vault in a short window, compared to its own
+// recent baseline. A sudden spike often indicates automated exfiltration
+// (e.g. a compromised identity or leaked service principal credential
+// systematically dumping stored secrets) rather than normal human usage.
+//
+// Data source: AzureDiagnostics (Key Vault diagnostic logs, category:
+//              AuditEvent) - requires diagnostic settings enabled on the
+//              vault, sent to this workspace (see monitoring.tf in the
+//              azure-secure-baseline repo for how that's configured)
+// MITRE ATT&CK: T1552.001 - Unsecured Credentials: Credentials In Files /
+//               T1555 - Credentials from Password Stores
+// Severity: High
+//
+// Known false positives:
+//   - Application startup/restart, where a service legitimately bulk-loads
+//     several secrets at once
+//   - CI/CD pipeline runs that read multiple secrets per deployment
+//   - A baseline period that's too short to capture a legitimate app's
+//     normal burst pattern - tune the Z-score threshold per environment
+
+let TimeRange = 7d;
+let BaselineWindow = 6d; // all but the most recent day, used to build the per-identity baseline
+let RecentWindow = 1d;
+let ZScoreThreshold = 3.0;
+let KvEvents = AzureDiagnostics
+    | where TimeGenerated > ago(TimeRange)
+    | where ResourceProvider == "MICROSOFT.KEYVAULT"
+    | where OperationName in ("SecretGet", "KeyGet", "SecretList", "KeyList")
+    | extend CallerIdentity = tostring(identity_claim_appid_g)
+    | extend CallerIdentity = iff(isempty(CallerIdentity), tostring(identity_claim_upn_s), CallerIdentity);
+let Baseline = KvEvents
+    | where TimeGenerated between (ago(TimeRange) .. ago(TimeRange - BaselineWindow))
+    | summarize DailyCount = count() by CallerIdentity, bin(TimeGenerated, 1d)
+    | summarize AvgDaily = avg(DailyCount), StdevDaily = stdev(DailyCount) by CallerIdentity;
+let Recent = KvEvents
+    | where TimeGenerated > ago(RecentWindow)
+    | summarize RecentCount = count(), Resource = any(Resource) by CallerIdentity;
+Recent
+| join kind=inner (Baseline) on CallerIdentity
+| extend ZScore = iff(StdevDaily > 0, (RecentCount - AvgDaily) / StdevDaily, 0.0)
+| where ZScore > ZScoreThreshold and RecentCount > AvgDaily
+| project CallerIdentity, Resource, RecentCount, AvgDaily = round(AvgDaily, 1),
+          ZScore = round(ZScore, 1)
+| order by ZScore desc

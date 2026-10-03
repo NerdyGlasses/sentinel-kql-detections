@@ -1,0 +1,36 @@
+// Title: Possible MFA Fatigue / Push Bombing
+//
+// Description: Flags a user who received multiple MFA prompts in a short
+// window followed by an approval - the pattern behind "MFA fatigue" or
+// "push bombing" attacks, where an attacker with valid credentials spams
+// push notifications until the user approves one out of annoyance or
+// confusion (as seen in several real-world breaches, e.g. Uber 2022).
+//
+// Data source: SigninLogs (Microsoft Entra ID sign-in logs)
+// MITRE ATT&CK: T1621 - Multi-Factor Authentication Request Generation
+// Severity: High
+//
+// Known false positives:
+//   - Poor network connectivity causing a user's own device to retry prompts
+//   - Users switching between multiple registered MFA devices
+//   - Legitimate repeated sign-in attempts after a typo'd password
+
+let TimeRange = 1d;
+let FailureThreshold = 3; // denied/timed-out MFA prompts before a success
+SigninLogs
+| where TimeGenerated > ago(TimeRange)
+| where AuthenticationRequirement == "multiFactorAuthentication"
+| extend MfaResult = tostring(AuthenticationDetails[0].authenticationStepResultDetail)
+| where isnotempty(MfaResult)
+| summarize
+    Denied = countif(MfaResult has_any ("Denied", "declined", "timed out", "Timeout")),
+    Approved = countif(MfaResult has "succeeded" or ResultType == 0),
+    Attempts = count(),
+    FirstAttempt = min(TimeGenerated),
+    LastAttempt = max(TimeGenerated),
+    IPAddresses = make_set(IPAddress, 5)
+    by UserPrincipalName, bin(TimeGenerated, 30m)
+| where Denied >= FailureThreshold and Approved > 0
+| project UserPrincipalName, TimeGenerated, Denied, Approved, Attempts,
+          FirstAttempt, LastAttempt, IPAddresses
+| order by Denied desc

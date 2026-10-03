@@ -1,0 +1,42 @@
+// Title: NSG Rule Opened to the Internet
+//
+// Description: Flags whenever a Network Security Group rule is created or
+// updated to allow inbound traffic from any source ("*" or "0.0.0.0/0" or
+// "Internet") on a sensitive port (SSH, RDP, or a database port). This is
+// exactly the kind of misconfiguration the azure-secure-baseline repo's
+// checkov scans catch before deployment - this detection is the runtime
+// equivalent, catching it if it happens live, e.g. via a rushed manual
+// change outside of Terraform.
+//
+// Data source: AzureActivity (control-plane/management operations)
+// MITRE ATT&CK: T1562.007 - Impair Defenses: Disable or Modify Cloud
+//               Firewall
+// Severity: High
+//
+// Known false positives:
+//   - A legitimate, approved change to expose a genuinely public service
+//     (e.g. a public-facing web server on 80/443) - this detection
+//     deliberately focuses on admin/database ports to reduce this kind of
+//     noise, but review scope if it still fires often
+//   - Short-lived rules opened for a specific troubleshooting window and
+//     promptly closed again - check LastSeen vs now to judge whether it's
+//     still open
+
+let SensitivePorts = dynamic(["22", "3389", "1433", "3306", "5432", "6379", "27017"]);
+let OpenSources = dynamic(["*", "0.0.0.0/0", "Internet", "Any"]);
+AzureActivity
+| where OperationNameValue has "MICROSOFT.NETWORK/NETWORKSECURITYGROUPS/SECURITYRULES/WRITE"
+| where ActivityStatusValue == "Success"
+| extend Props = parse_json(Properties)
+| extend RequestBody = parse_json(tostring(Props.requestbody))
+| extend Access = tostring(RequestBody.properties.access),
+         Direction = tostring(RequestBody.properties.direction),
+         SourceAddressPrefix = tostring(RequestBody.properties.sourceAddressPrefix),
+         DestinationPortRange = tostring(RequestBody.properties.destinationPortRange),
+         RuleName = tostring(RequestBody.name)
+| where Direction == "Inbound" and Access == "Allow"
+| where SourceAddressPrefix in (OpenSources)
+| where DestinationPortRange in (SensitivePorts) or DestinationPortRange == "*"
+| project TimeGenerated, Caller, RuleName, DestinationPortRange,
+          SourceAddressPrefix, ResourceGroup, Resource = _ResourceId
+| order by TimeGenerated desc

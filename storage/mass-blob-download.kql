@@ -1,0 +1,41 @@
+// Title: Mass Blob Download (Potential Data Exfiltration)
+//
+// Description: Flags a caller downloading an unusually large number of
+// blobs, or an unusually large total volume, from a storage account in a
+// short window. This is a common late-stage pattern in a breach - once an
+// attacker has access, they often pull as much data as possible before
+// being detected.
+//
+// Data source: StorageBlobLogs (requires diagnostic settings sending blob
+//              read logs to this workspace - see monitoring.tf in the
+//              azure-secure-baseline repo)
+// MITRE ATT&CK: T1530 - Data from Cloud Storage
+// Severity: High
+//
+// Known false positives:
+//   - Scheduled backup/sync jobs or data pipeline runs
+//   - A legitimate bulk migration or reporting job
+//   - CDN or caching layers reading blobs on the public's behalf (should be
+//     rare here, since the baseline this pairs with disables public access)
+
+let TimeRange = 1h;
+let RequestCountThreshold = 100;
+let TotalBytesThresholdMB = 500;
+StorageBlobLogs
+| where TimeGenerated > ago(TimeRange)
+| where OperationName == "GetBlob"
+| where StatusCode == 200
+| extend CallerIdentity = iff(isnotempty(AuthenticationType) and AuthenticationType != "Anonymous",
+                               tostring(RequesterObjectId), CallerIpAddress)
+| summarize
+    RequestCount = count(),
+    TotalBytes = sum(ResponseBodySize),
+    DistinctBlobs = dcount(Uri),
+    FirstSeen = min(TimeGenerated),
+    LastSeen = max(TimeGenerated)
+    by CallerIdentity, AccountName, bin(TimeGenerated, 1h)
+| extend TotalMB = round(TotalBytes / 1024.0 / 1024.0, 1)
+| where RequestCount > RequestCountThreshold or TotalMB > TotalBytesThresholdMB
+| project TimeGenerated, CallerIdentity, AccountName, RequestCount,
+          DistinctBlobs, TotalMB, FirstSeen, LastSeen
+| order by TotalMB desc
